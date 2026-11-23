@@ -5,8 +5,21 @@ Thêm chuỗi mới: bọc bằng tr("...") trong app.py rồi thêm bản dịc
 Biến trong chuỗi dùng cú pháp {ten} và truyền qua tr("...{ten}...", ten=...).
 """
 
+import sys
+
 LANGS = ("vi", "en")
 _lang = "vi"
+
+# Trên macOS đổi phím tắt kiểu Windows trong chuỗi hướng dẫn sang phím tương ứng của Mac
+# (⌘⌃⇧4 = chụp vùng màn hình vào clipboard). Khoá dịch giữ nguyên chuỗi gốc.
+_MAC_KEYS = (("Win+Shift+S", "⌘⌃⇧4"), ("Ctrl+V", "⌘V"))
+
+
+def _platform_keys(s: str) -> str:
+    if sys.platform == "darwin":
+        for win, mac in _MAC_KEYS:
+            s = s.replace(win, mac)
+    return s
 
 
 def set_lang(code: str) -> None:
@@ -19,7 +32,7 @@ def get_lang() -> str:
 
 
 def tr(text: str, **kw) -> str:
-    s = EN.get(text, text) if _lang == "en" else text
+    s = _platform_keys(EN.get(text, text) if _lang == "en" else text)
     return s.format(**kw) if kw else s
 
 
@@ -174,4 +187,25 @@ EN = {
     "{n} ảnh không đọc được QR.": "{n} image(s) had no readable QR.",
     "Đã có trong app — bỏ chọn sẵn để tránh trùng": "Already in the app — unchecked to avoid duplicates",
     "{n} số": "{n} digits",
+
+    # --- Ghép mật khẩu khi copy ---
+    "Ghép mật khẩu khi copy  ▸": "Add password when copying  ▸",
+    "Ghép mật khẩu khi copy  ▾": "Add password when copying  ▾",
+    "Chuỗi trước mã (prefix)": "Text before code (prefix)",
+    "Chuỗi sau mã (suffix)": "Text after code (suffix)",
+    "Hiện mật khẩu (cả ở màn hình chính)": "Show password (also on the main screen)",
+    "Để trống = chỉ copy mã OTP. VD OpenVPN: điền mật khẩu vào prefix, click là copy <mật khẩu><OTP>.":
+        "Leave empty to copy only the OTP. E.g. OpenVPN: put your password in prefix, "
+        "a click copies <password><OTP>.",
+    "Khi click sẽ copy: {sample}": "A click will copy: {sample}",
+    "  Copy mật khẩu + mã": "  Copy password + code",
+    "  Copy chỉ mã OTP": "  Copy OTP only",
+    "Đã copy mật khẩu + mã {name}": "Copied password + code for {name}",
+
+    # --- macOS (Keychain) ---
+    "Không tìm thấy khoá giải mã trong Keychain (mục \"{svc}\")":
+        "Decryption key not found in the Keychain (item \"{svc}\")",
+    "Khoá trong Keychain không khớp với file dữ liệu": "The Keychain key does not match the data file",
+    "Dữ liệu cũ chưa đọc được nên thay đổi không được lưu. Hãy mở lại app và cho phép truy cập Keychain.":
+        "Existing data could not be read, so changes were not saved. Reopen the app and allow Keychain access.",
 }

@@ -1,0 +1,11 @@
+customtkinter>=5.2
+zxing-cpp>=2.2
+pillow>=10.0
+tkinterdnd2>=0.4      # kéo-thả file (tuỳ chọn, thiếu thì app vẫn chạy)
+
+# macOS: khoá mã hoá dữ liệu cất trong Keychain
+keyring>=24 ; sys_platform == "darwin"
+cryptography>=41 ; sys_platform == "darwin"
+
+# Đóng gói
+pyinstaller>=6.0

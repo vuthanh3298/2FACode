@@ -1,8 +1,10 @@
-"""2FA Code - ứng dụng desktop lấy mã 2FA (TOTP) trên Windows.
+"""2FA Code - ứng dụng desktop lấy mã 2FA (TOTP) cho Windows và macOS.
 
 Giao diện: customtkinter. Thuật toán TOTP chỉ dùng thư viện chuẩn.
-Secret được lưu ở %APPDATA%\\TwoFACode\\accounts.dat và được mã hoá bằng
-Windows DPAPI (chỉ tài khoản Windows của bạn trên máy này giải mã được).
+Windows: secret lưu ở %APPDATA%\\TwoFACode\\accounts.dat, mã hoá bằng Windows DPAPI
+(chỉ tài khoản Windows của bạn trên máy này giải mã được).
+macOS: secret lưu ở ~/Library/Application Support/TwoFACode/accounts.dat, mã hoá
+(Fernet) bằng khoá ngẫu nhiên cất trong Keychain của user.
 """
 
 import base64
@@ -15,7 +17,6 @@ import struct
 import sys
 import time
 import tkinter as tk
-from ctypes import wintypes
 from tkinter import filedialog, messagebox
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -32,8 +33,16 @@ from PIL import Image, ImageDraw, ImageEnhance, ImageGrab, ImageOps, ImageTk
 
 from i18n import get_lang, set_lang, tr
 
+IS_WIN = sys.platform == "win32"
+IS_MAC = sys.platform == "darwin"
+if IS_WIN:
+    from ctypes import wintypes
+
 APP_NAME = "2FA Code"
-DATA_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "TwoFACode")
+if IS_MAC:
+    DATA_DIR = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "TwoFACode")
+else:
+    DATA_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "TwoFACode")
 DATA_FILE = os.path.join(DATA_DIR, "accounts.dat")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 
@@ -249,11 +258,49 @@ def account_from_qr(texts: list[str]) -> dict:
 # Lưu trữ mã hoá bằng Windows DPAPI
 # ----------------------------------------------------------------------------
 class _Blob(ctypes.Structure):
-    _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+    _fields_ = [("cbData", wintypes.DWORD if IS_WIN else ctypes.c_uint32),
+                ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+
+KEYCHAIN_SERVICE = "TwoFACode"
+KEYCHAIN_ACCOUNT = "accounts-key"
+
+
+def _mac_fernet(create: bool):
+    """Khoá Fernet cất trong macOS Keychain. Chỉ tạo khoá mới khi chưa có file dữ liệu,
+    tránh trường hợp Keychain đọc lỗi rồi ghi đè dữ liệu cũ bằng khoá khác."""
+    from cryptography.fernet import Fernet
+    from keyring.backends import macOS
+
+    kr = macOS.Keyring()
+    key = kr.get_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+    if not key:
+        if not create:
+            raise RuntimeError(tr("Không tìm thấy khoá giải mã trong Keychain (mục \"{svc}\")",
+                                  svc=KEYCHAIN_SERVICE))
+        key = Fernet.generate_key().decode("ascii")
+        kr.set_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, key)
+    return Fernet(key.encode("ascii"))
+
+
+def _protect(data: bytes) -> bytes:
+    if IS_MAC:
+        return _mac_fernet(create=not os.path.exists(DATA_FILE)).encrypt(data)
+    return _dpapi(data, protect=True)
+
+
+def _unprotect(data: bytes) -> bytes:
+    if IS_MAC:
+        from cryptography.fernet import InvalidToken
+        try:
+            return _mac_fernet(create=False).decrypt(data)
+        except InvalidToken:
+            raise RuntimeError(tr("Khoá trong Keychain không khớp với file dữ liệu"))
+    return _dpapi(data, protect=False)
 
 
 def _dpapi(data: bytes, protect: bool) -> bytes:
-    if sys.platform != "win32":
+    if not IS_WIN:
         return data
     buf = ctypes.create_string_buffer(data, len(data))
     blob_in = _Blob(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
@@ -279,12 +326,12 @@ def load_accounts() -> list[dict]:
         return []
     with open(DATA_FILE, "rb") as f:
         raw = f.read()
-    return json.loads(_dpapi(raw, protect=False).decode("utf-8"))
+    return json.loads(_unprotect(raw).decode("utf-8"))
 
 
 def save_accounts(accounts: list[dict]) -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
-    data = _dpapi(json.dumps(accounts, ensure_ascii=False).encode("utf-8"), protect=True)
+    data = _protect(json.dumps(accounts, ensure_ascii=False).encode("utf-8"))
     tmp = DATA_FILE + ".tmp"
     with open(tmp, "wb") as f:
         f.write(data)
@@ -333,7 +380,10 @@ ZONE = ("#f8fafc", "#14171e")
 AVATAR_COLORS = ["#2563eb", "#7c3aed", "#db2777", "#ea580c", "#16a34a",
                  "#0891b2", "#ca8a04", "#4f46e5", "#be123c", "#0d9488"]
 
-FONT = "Segoe UI"
+FONT = "Helvetica Neue" if IS_MAC else "Segoe UI"
+MOD = "Command" if IS_MAC else "Control"  # phím tắt: ⌘ trên macOS, Ctrl trên Windows
+# Chuột phải: Tk trên macOS báo Button-2 (Tk 8.6) hoặc Button-3 (Tk 8.7+), và Ctrl+click
+RIGHT_CLICK = ("<Button-2>", "<Button-3>", "<Control-Button-1>") if IS_MAC else ("<Button-3>",)
 APPEARANCE_MODES = [("System", "Hệ thống"), ("Light", "Sáng"), ("Dark", "Tối")]
 
 
@@ -385,7 +435,11 @@ def set_icon(win):
     path = resource_path("icon.ico")
     if os.path.exists(path):
         try:
-            win.iconbitmap(path)
+            if IS_WIN:
+                win.iconbitmap(path)
+            else:  # macOS/Linux không đọc .ico qua iconbitmap; icon Dock của bản build lấy từ .icns
+                win._icon_img = ImageTk.PhotoImage(Image.open(path).convert("RGBA").resize((128, 128)))
+                win.iconphoto(True, win._icon_img)
         except Exception:
             pass
 
@@ -434,8 +488,33 @@ def safe_clipboard_image():
         return None
 
 
+_mac_pb = None
+
+
+def _mac_change_count() -> int:
+    """[NSPasteboard generalPasteboard].changeCount qua Objective-C runtime (không cần PyObjC)."""
+    global _mac_pb
+    if _mac_pb is None:
+        import ctypes.util
+        ctypes.cdll.LoadLibrary("/System/Library/Frameworks/AppKit.framework/AppKit")
+        objc = ctypes.cdll.LoadLibrary(ctypes.util.find_library("objc"))
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.objc_getClass.argtypes = [ctypes.c_char_p]
+        objc.sel_registerName.restype = ctypes.c_void_p
+        objc.sel_registerName.argtypes = [ctypes.c_char_p]
+        send = objc.objc_msgSend
+        send.restype = ctypes.c_void_p
+        send.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        pb = send(objc.objc_getClass(b"NSPasteboard"), objc.sel_registerName(b"generalPasteboard"))
+        _mac_pb = (send, pb, objc.sel_registerName(b"changeCount"))
+    send, pb, sel = _mac_pb
+    return (send(pb, sel) or 0) & 0x7FFFFFFF
+
+
 def clipboard_seq() -> int:
     try:
+        if IS_MAC:
+            return _mac_change_count()
         return ctypes.windll.user32.GetClipboardSequenceNumber()
     except Exception:
         return 0
@@ -499,9 +578,16 @@ def pick_from_screen(win, done, on_error):
 
     def grab():
         try:
-            shot = ImageGrab.grab(all_screens=True)
-            u32 = ctypes.windll.user32
-            origin = (u32.GetSystemMetrics(76), u32.GetSystemMetrics(77))  # góc trái-trên màn hình ảo
+            if IS_MAC:
+                # screencapture chỉ chụp màn hình chính, ảnh theo pixel thật (Retina = 2x điểm)
+                shot = ImageGrab.grab()
+                origin = (0, 0)
+                scale = max(1.0, shot.width / max(1, win.winfo_screenwidth()))
+            else:
+                shot = ImageGrab.grab(all_screens=True)
+                u32 = ctypes.windll.user32
+                origin = (u32.GetSystemMetrics(76), u32.GetSystemMetrics(77))  # góc trái-trên màn hình ảo
+                scale = 1.0
         except Exception as e:
             restore()
             on_error(tr("Không chụp được màn hình: {err}", err=e))
@@ -510,7 +596,7 @@ def pick_from_screen(win, done, on_error):
             win.grab_release()
         except tk.TclError:
             pass
-        RegionPicker(win, shot, origin, finished)
+        RegionPicker(win, shot, origin, finished, scale)
 
     win.after(300, grab)
 
@@ -546,16 +632,23 @@ class RegionPicker(tk.Toplevel):
     """Phủ toàn màn hình bằng ảnh chụp làm tối; người dùng kéo chuột chọn vùng có QR
     (giống Snipping Tool). Mã QR phát hiện sẵn được đóng khung xanh, click là chọn."""
 
-    def __init__(self, master, shot: Image.Image, origin: tuple[int, int], on_done):
+    def __init__(self, master, shot: Image.Image, origin: tuple[int, int], on_done, scale: float = 1.0):
         super().__init__(master)
         self.on_done = on_done
-        self.shot = shot.convert("RGB")
+        # full: ảnh gốc để quét QR; shot: ảnh hiển thị theo toạ độ màn hình (khác nhau khi Retina)
+        self.full = shot.convert("RGB")
+        self.scale = scale
+        if scale == 1.0:
+            self.shot = self.full
+        else:
+            self.shot = self.full.resize((round(self.full.width / scale), round(self.full.height / scale)),
+                                         Image.LANCZOS)
         self.ox, self.oy = origin
         w, h = self.shot.size
         self.overrideredirect(True)
         self.geometry(f"{w}x{h}+{self.ox}+{self.oy}")
         self.attributes("-topmost", True)
-        self.k = self.winfo_fpixels("1i") / 96  # hệ số DPI
+        self.k = 1.0 if IS_MAC else self.winfo_fpixels("1i") / 96  # hệ số DPI
 
         self.c = tk.Canvas(self, width=w, height=h, highlightthickness=0, bd=0, bg="black", cursor="crosshair")
         self.c.pack(fill="both", expand=True)
@@ -574,7 +667,8 @@ class RegionPicker(tk.Toplevel):
         self.c.bind("<B1-Motion>", self.on_drag)
         self.c.bind("<ButtonRelease-1>", self.on_release)
         self.c.bind("<Motion>", self.on_hover)
-        self.c.bind("<Button-3>", lambda e: self.finish(None))
+        for seq in RIGHT_CLICK:
+            self.c.bind(seq, lambda e: self.finish(None))
         self.bind("<Escape>", lambda e: self.finish(None))
         self.bind("<Return>", lambda e: self.boxes and self.pick(self._pad(self.boxes[0])))
 
@@ -618,7 +712,9 @@ class RegionPicker(tk.Toplevel):
         return img
 
     def detect(self):
-        found = scan_qr(self.shot)
+        found = scan_qr(self.full)
+        if self.scale != 1.0:
+            found = [(t, tuple(v / self.scale for v in b)) for t, b in found]
         totp_boxes = [b for t, b in found if t.lower().startswith("otpauth")]
         self.boxes = totp_boxes or [b for _, b in found]
         for b in self.boxes:
@@ -685,8 +781,8 @@ class RegionPicker(tk.Toplevel):
         self.pick((min(x0, e.x), min(y0, e.y), max(x0, e.x), max(y0, e.y)))
 
     def pick(self, box):
-        x0, y0, x1, y1 = [int(v) for v in box]
-        region = self.shot.crop((max(0, x0), max(0, y0), min(self.shot.width, x1), min(self.shot.height, y1)))
+        x0, y0, x1, y1 = [int(v * self.scale) for v in box]
+        region = self.full.crop((max(0, x0), max(0, y0), min(self.full.width, x1), min(self.full.height, y1)))
         found = scan_qr(region)
         if not found:
             self.c.delete("sel")
@@ -793,6 +889,27 @@ class AccountDialog(ctk.CTkToplevel):
         self.adv_anchor = ctk.CTkFrame(body, fg_color="transparent", height=1)
         self.adv_anchor.pack(fill="x")
 
+        # Ghép chuỗi khi copy (VD OpenVPN: ô password = <mật khẩu> + <OTP>)
+        self.join_open = False
+        self.join_btn = ctk.CTkButton(body, text=tr("Ghép mật khẩu khi copy  ▸"), font=f_label,
+                                      fg_color="transparent", hover_color=SECONDARY, text_color=MUTED, anchor="w",
+                                      height=30, width=10, command=self.toggle_join)
+        self.join_btn.pack(anchor="w", pady=(2, 0))
+        self.join = ctk.CTkFrame(body, fg_color="transparent")
+        self.join.columnconfigure((0, 1), weight=1, uniform="j")
+        self.prefix_entry = self._join_field(0, tr("Chuỗi trước mã (prefix)"))
+        self.suffix_entry = self._join_field(1, tr("Chuỗi sau mã (suffix)"))
+        self.show_join = ctk.CTkCheckBox(self.join, text=tr("Hiện mật khẩu (cả ở màn hình chính)"),
+                                         font=ctk.CTkFont(FONT, 12), text_color=MUTED,
+                                         checkbox_width=18, checkbox_height=18, corner_radius=5,
+                                         command=self._toggle_join_mask)
+        self.show_join.grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.join_hint = ctk.CTkLabel(self.join, text="", font=ctk.CTkFont(FONT, 12), text_color=MUTED,
+                                      anchor="w", justify="left", wraplength=380)
+        self.join_hint.grid(row=3, column=0, columnspan=2, sticky="w", pady=(2, 0))
+        self.join_anchor = ctk.CTkFrame(body, fg_color="transparent", height=1)
+        self.join_anchor.pack(fill="x")
+
         btns = ctk.CTkFrame(body, fg_color="transparent")
         btns.pack(fill="x", pady=(20, 0))
         btns.columnconfigure((0, 1), weight=1, uniform="b")
@@ -808,15 +925,25 @@ class AccountDialog(ctk.CTkToplevel):
             self.secret_entry.insert(0, account["secret"])
             if (acc.get("digits", 6), acc.get("period", 30), acc.get("algorithm", "SHA1")) != (6, 30, "SHA1"):
                 self.toggle_adv()
+            self.prefix_entry.insert(0, acc.get("prefix", ""))
+            self.suffix_entry.insert(0, acc.get("suffix", ""))
+            if acc.get("prefix") or acc.get("suffix"):
+                self.toggle_join()
+            if acc.get("show_joined"):
+                self.show_join.select()
+                self._toggle_join_mask()
+        self.update_join_hint()
 
         for w in (self.secret_entry, self.name_entry):
             w.bind("<KeyRelease>", lambda e: self.update_preview())
+        for w in (self.prefix_entry, self.suffix_entry):
+            w.bind("<KeyRelease>", lambda e: self.update_join_hint())
         for v in (self.digits, self.period, self.algo):
             v.configure(command=lambda _: self.update_preview())
         self.bind("<Return>", lambda e: self.save())
         self.bind("<Escape>", lambda e: self.destroy())
-        self.bind("<Control-v>", self._on_paste)
-        self.bind("<Control-V>", self._on_paste)
+        self.bind(f"<{MOD}-v>", self._on_paste)
+        self.bind(f"<{MOD}-V>", self._on_paste)
 
         # Kéo-thả ảnh / file ảnh / link otpauth vào cửa sổ
         if getattr(master, "dnd_ok", False):
@@ -859,6 +986,45 @@ class AccountDialog(ctk.CTkToplevel):
         om.set(value if value in values else values[0])
         om.pack()
         return om
+
+    def _join_field(self, col, label):
+        ctk.CTkLabel(self.join, text=label, font=ctk.CTkFont(FONT, 12), text_color=MUTED,
+                     anchor="w").grid(row=0, column=col, sticky="w", padx=(0, 6) if col == 0 else (6, 0))
+        e = ctk.CTkEntry(self.join, height=38, corner_radius=10, font=ctk.CTkFont(FONT, 14), fg_color=INPUT,
+                         border_color=BORDER, border_width=1, text_color=TEXT, show="•", width=10)
+        e.grid(row=1, column=col, sticky="ew", padx=(0, 6) if col == 0 else (6, 0))
+        return e
+
+    def _toggle_join_mask(self):
+        show = "" if self.show_join.get() else "•"
+        for e in (self.prefix_entry, self.suffix_entry):
+            e.configure(show=show)
+        self.update_join_hint()
+
+    def toggle_join(self):
+        self.join_open = not self.join_open
+        if self.join_open:
+            self.join.pack(fill="x", pady=(4, 0), before=self.join_anchor)
+            self.join_btn.configure(text=tr("Ghép mật khẩu khi copy  ▾"))
+            # Hộp thoại cao thêm: đẩy lên nếu tràn khỏi đáy màn hình
+            self.update_idletasks()
+            bottom = self.winfo_screenheight() - 60
+            if self.winfo_rooty() + self.winfo_height() > bottom:
+                self.geometry(f"+{max(self.winfo_rootx(), 0)}+{max(bottom - self.winfo_height(), 0)}")
+        else:
+            self.join.pack_forget()
+            self.join_btn.configure(text=tr("Ghép mật khẩu khi copy  ▸"))
+
+    def update_join_hint(self):
+        pre, suf = self.prefix_entry.get(), self.suffix_entry.get()
+        if not pre and not suf:
+            self.join_hint.configure(text=tr("Để trống = chỉ copy mã OTP. VD OpenVPN: điền mật khẩu vào "
+                                             "prefix, click là copy <mật khẩu><OTP>."))
+            return
+        def part(s):
+            return s if self.show_join.get() else "•" * len(s)
+        sample = part(pre) + "123456" + part(suf)
+        self.join_hint.configure(text=tr("Khi click sẽ copy: {sample}", sample=sample))
 
     # -- QR -------------------------------------------------------------
     def _on_paste(self, _e):
@@ -1039,6 +1205,12 @@ class AccountDialog(ctk.CTkToplevel):
                 "algorithm": self.algo.get(),
             }
         totp(acc["secret"], acc["digits"], acc["period"], acc["algorithm"])
+        # Giữ nguyên chuỗi người dùng nhập (không strip: mật khẩu có thể có khoảng trắng)
+        for key, entry in (("prefix", self.prefix_entry), ("suffix", self.suffix_entry)):
+            if entry.get():
+                acc[key] = entry.get()
+        if self.show_join.get() and (acc.get("prefix") or acc.get("suffix")):
+            acc["show_joined"] = True  # hiện cả mật khẩu trên thẻ ở màn hình chính
         return acc
 
     def update_preview(self):
@@ -1168,8 +1340,8 @@ class ImportDialog(ctk.CTkToplevel):
         self.import_btn.grid(row=0, column=1, sticky="ew", padx=(6, 0))
 
         self.bind("<Escape>", lambda e: self.destroy())
-        self.bind("<Control-v>", self._on_paste)
-        self.bind("<Control-V>", self._on_paste)
+        self.bind(f"<{MOD}-v>", self._on_paste)
+        self.bind(f"<{MOD}-V>", self._on_paste)
         if getattr(app, "dnd_ok", False):
             try:
                 self.drop_target_register(DND_FILES, DND_TEXT)
@@ -1432,10 +1604,18 @@ class AccountCard(ctk.CTkFrame):
                                    font=ctk.CTkFont(FONT, 18, "bold"))
         self.avatar.grid(row=0, column=0, rowspan=2, padx=(16, 14), pady=14)
 
-        self.name = ctk.CTkLabel(self, text=ellipsize(acc["name"]), font=ctk.CTkFont(FONT, 14),
+        joined = bool(acc.get("prefix") or acc.get("suffix"))
+        name_text = ellipsize(acc["name"], 28) + "  🔑" if joined else ellipsize(acc["name"])
+        self.name = ctk.CTkLabel(self, text=name_text, font=ctk.CTkFont(FONT, 14),
                                  text_color=MUTED, anchor="w", height=20)
         self.name.grid(row=0, column=1, sticky="sw", pady=(14, 0))
-        self.code = ctk.CTkLabel(self, text="", font=ctk.CTkFont(FONT, 30, "bold"), text_color=ACCENT,
+        # Hiện cả mật khẩu trên thẻ: chuỗi dài hơn nên thu nhỏ chữ cho vừa thẻ
+        self.show_full = joined and bool(acc.get("show_joined"))
+        code_size = 30
+        if self.show_full:
+            n = len(acc.get("prefix", "")) + acc["digits"] + len(acc.get("suffix", ""))
+            code_size = 26 if n <= 13 else 20 if n <= 17 else 16
+        self.code = ctk.CTkLabel(self, text="", font=ctk.CTkFont(FONT, code_size, "bold"), text_color=ACCENT,
                                  anchor="w", height=40)
         self.code.grid(row=1, column=1, sticky="nw", pady=(0, 12))
 
@@ -1454,7 +1634,11 @@ class AccountCard(ctk.CTkFrame):
         self.more.grid(row=0, column=3, rowspan=2, padx=(0, 10))
 
         self.menu = tk.Menu(self, tearoff=0, font=(FONT, 10))
-        self.menu.add_command(label=tr("  Copy mã"), command=lambda: app.copy(self))
+        if joined:
+            self.menu.add_command(label=tr("  Copy mật khẩu + mã"), command=lambda: app.copy(self))
+            self.menu.add_command(label=tr("  Copy chỉ mã OTP"), command=lambda: app.copy(self, code_only=True))
+        else:
+            self.menu.add_command(label=tr("  Copy mã"), command=lambda: app.copy(self))
         self.menu.add_command(label=tr("  Sửa"), command=lambda: app.edit(acc))
         self.menu.add_command(label=tr("  Lên trên"), command=lambda: app.move(acc, -1))
         self.menu.add_command(label=tr("  Xuống dưới"), command=lambda: app.move(acc, 1))
@@ -1463,7 +1647,8 @@ class AccountCard(ctk.CTkFrame):
 
         for w in (self, self.avatar, self.name, self.code, self.ring):
             w.bind("<Button-1>", lambda e: app.copy(self))
-            w.bind("<Button-3>", lambda e: self.menu.tk_popup(e.x_root, e.y_root))
+            for seq in RIGHT_CLICK:
+                w.bind(seq, lambda e: self.menu.tk_popup(e.x_root, e.y_root))
             w.bind("<Enter>", lambda e: self.hover(True))
             w.bind("<Leave>", self._on_leave)
             try:
@@ -1500,7 +1685,13 @@ class AccountCard(ctk.CTkFrame):
         warn = left <= 5
         if now >= self.copied_until:
             try:
-                text = fmt_code(totp(a["secret"], a["digits"], period, a["algorithm"], now))
+                code = totp(a["secret"], a["digits"], period, a["algorithm"], now)
+                if self.show_full:  # đúng chuỗi sẽ được copy; quá dài thì cắt bớt đầu prefix
+                    text = a.get("prefix", "") + code + a.get("suffix", "")
+                    if len(text) > 22:  # luôn giữ trọn phần OTP ở cuối trong tầm nhìn
+                        text = "…" + text[-21:]
+                else:
+                    text = fmt_code(code)
             except Exception:
                 text = tr("lỗi key")
             self.code.configure(text=text, text_color=WARN if warn else ACCENT)
@@ -1537,19 +1728,23 @@ class App(ctk.CTk, _DnDBase):
         except Exception:
             self.dnd_ok = False
 
+        # macOS: nếu không đọc được (vd. bấm "Deny" khi Keychain hỏi) thì không cho ghi,
+        # tránh ghi đè file dữ liệu cũ bằng danh sách rỗng.
+        self.read_only = False
         try:
             self.accounts = load_accounts()
         except Exception as e:
             messagebox.showerror(APP_NAME, tr("Không đọc được dữ liệu:\n{err}", err=e))
             self.accounts = []
+            self.read_only = IS_MAC
         self.cards: list[AccountCard] = []
         set_lang(self.settings.get("lang", "vi"))
 
         self.build_ui()
-        self.bind("<Control-f>", lambda e: self.search.focus_set())
-        self.bind("<Control-n>", lambda e: self.add())
-        self.bind("<Control-v>", self._on_paste)
-        self.bind("<Control-V>", self._on_paste)
+        self.bind(f"<{MOD}-f>", lambda e: self.search.focus_set())
+        self.bind(f"<{MOD}-n>", lambda e: self.add())
+        self.bind(f"<{MOD}-v>", self._on_paste)
+        self.bind(f"<{MOD}-V>", self._on_paste)
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.rebuild()
         self.tick()
@@ -1633,6 +1828,10 @@ class App(ctk.CTk, _DnDBase):
         self._toast_job = self.after(1600, self.toast.place_forget)
 
     def persist(self):
+        if self.read_only:
+            messagebox.showerror(APP_NAME, tr("Dữ liệu cũ chưa đọc được nên thay đổi không được lưu. "
+                                              "Hãy mở lại app và cho phép truy cập Keychain."))
+            return
         try:
             save_accounts(self.accounts)
         except Exception as e:
@@ -1726,13 +1925,17 @@ class App(ctk.CTk, _DnDBase):
             self.persist()
             self.rebuild()
 
-    def copy(self, card: AccountCard):
+    def copy(self, card: AccountCard, code_only: bool = False):
         a = card.acc
         code = totp(a["secret"], a["digits"], a["period"], a["algorithm"])
+        pre, suf = ("", "") if code_only else (a.get("prefix", ""), a.get("suffix", ""))
         self.clipboard_clear()
-        self.clipboard_append(code)
+        self.clipboard_append(pre + code + suf)
         card.mark_copied()
-        self.show_toast(tr("Đã copy mã {name}", name=ellipsize(a["name"], 24)))
+        if pre or suf:
+            self.show_toast(tr("Đã copy mật khẩu + mã {name}", name=ellipsize(a["name"], 20)))
+        else:
+            self.show_toast(tr("Đã copy mã {name}", name=ellipsize(a["name"], 24)))
 
     def copy_first(self):
         visible = [c for c in self.cards if c.winfo_manager()]

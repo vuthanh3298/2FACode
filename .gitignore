@@ -1,0 +1,6 @@
+.venv/
+build/
+__pycache__/
+*.spec
+icon_preview.png
+.DS_Store
